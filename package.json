@@ -1,0 +1,7 @@
+{
+  "name": "txlemetry-php",
+  "version": "5.0.0",
+  "private": true,
+  "description": "Release metadata for the Txlemetry PHP SDK",
+  "packageManager": "pnpm@11.13.1"
+}

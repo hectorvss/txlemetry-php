@@ -1,0 +1,269 @@
+<?php
+
+namespace Txlemetry;
+
+use Symfony\Component\Clock\Clock;
+
+/**
+ * Base class for consumers that batch messages before delivery.
+ *
+ * PHP has no portable in-process background timer, so flush_interval_seconds is enforced
+ * opportunistically when another message is enqueued. Explicit flushes and
+ * destruction still drain pending messages immediately.
+ *
+ * @internal
+ */
+abstract class QueueConsumer extends Consumer
+{
+    protected const MAX_BATCH_PAYLOAD_SIZE = 1024 * 1024; // 1MB
+    protected const MAX_BATCH_PAYLOAD_SIZE_HUMAN = (self::MAX_BATCH_PAYLOAD_SIZE / 1024) . 'KB';
+
+    // flushBatch() returns this when the batch may succeed later and should remain queued.
+    protected const FLUSH_BATCH_RETRYABLE_FAILURE = 'retryable_failure';
+
+    // flushBatch() returns this when retrying the same batch would block the queue.
+    protected const FLUSH_BATCH_NON_RETRYABLE_FAILURE = 'non_retryable_failure';
+
+    protected $type = "QueueConsumer";
+
+    protected $queue;
+    protected $max_queue_size = 10000;
+    protected $batch_size = 100;
+    protected $flush_interval = 5.0;
+    protected $flush_after = null;
+    protected $maximum_backoff_duration = 10000;    // Set maximum waiting limit to 10s
+    protected $host = "app.txlemetry.com";
+    protected $compress_request = false;
+
+    /**
+     * Store our api key and options as part of this consumer
+     * @param string $apiKey
+     * @param array $options Consumer options.
+     */
+    public function __construct($apiKey, $options = array())
+    {
+        parent::__construct($apiKey, $options);
+
+        if (isset($options["max_queue_size"])) {
+            $this->max_queue_size = $options["max_queue_size"];
+        }
+
+        if (isset($options["batch_size"]) && (int) $options["batch_size"] > 0) {
+            $this->batch_size = (int) $options["batch_size"];
+        }
+
+        if (isset($options["flush_interval_seconds"])) {
+            $flushInterval = $options["flush_interval_seconds"];
+            if (is_int($flushInterval) || is_float($flushInterval)) {
+                $flushInterval = (float) $flushInterval;
+                if (is_finite($flushInterval) && $flushInterval >= 0) {
+                    $this->flush_interval = $flushInterval;
+                }
+            }
+        }
+
+        if (isset($options["maximum_backoff_duration"])) {
+            $this->maximum_backoff_duration = (int) $options["maximum_backoff_duration"];
+        }
+
+        if (isset($options["host"])) {
+            $this->host = $options["host"];
+
+            if ($this->host && preg_match("/^https?:\\/\\//i", $this->host)) {
+                $this->options['ssl'] = substr($this->host, 0, 5) == 'https';
+                $this->host = preg_replace("/^https?:\\/\\//i", "", $this->host);
+            }
+        }
+
+        if (isset($options["compress_request"])) {
+            $this->compress_request = is_bool($options["compress_request"])
+                ? $options["compress_request"]
+                : (bool) json_decode($options["compress_request"]);
+        }
+
+        $this->queue = array();
+    }
+
+    /**
+     * Flush queued messages when the consumer is destroyed.
+     */
+    public function __destruct()
+    {
+        // Flush our queue on destruction
+        $this->flush();
+    }
+
+    /**
+     * Captures a user action
+     *
+     * @param array<string, mixed> $message Event payload.
+     * @return bool Whether the capture call succeeded.
+     */
+    public function capture(array $message)
+    {
+        return $this->enqueue($message);
+    }
+
+    /**
+     * Tags properties about the user.
+     *
+     * @param array<string, mixed> $message Identify payload.
+     * @return bool Whether the identify call succeeded.
+     */
+    public function identify(array $message)
+    {
+        return $this->enqueue($message);
+    }
+
+    /**
+     * Aliases from one user id to another
+     *
+     * @param array<string, mixed> $message Alias payload.
+     * @return bool Whether the alias call succeeded.
+     */
+    public function alias(array $message)
+    {
+        return $this->enqueue($message);
+    }
+
+    /**
+     * Flushes our queue of messages by batching them to the server.
+     *
+     * @return bool True when all queued batches were sent successfully.
+     */
+    public function flush()
+    {
+        $count = count($this->queue);
+        $success = true;
+
+        while ($count > 0 && $success) {
+            $batchSize = min($this->batch_size, $count);
+            $batch = array_slice($this->queue, 0, $batchSize);
+            $result = $this->flushBatch($batch);
+            $success = true === $result;
+
+            if ($success || self::FLUSH_BATCH_RETRYABLE_FAILURE !== $result) {
+                array_splice($this->queue, 0, $batchSize);
+            }
+
+            $count = count($this->queue);
+        }
+
+        $this->resetFlushTimer();
+
+        return $success;
+    }
+
+    /**
+     * Adds an item to our queue.
+     * @param mixed $item Queue item to append.
+     * @return bool Whether the call succeeded.
+     */
+    public function enqueue($item)
+    {
+        $count = count($this->queue);
+
+        if ($count >= $this->max_queue_size) {
+            return false;
+        }
+
+        $wasEmpty = $count === 0;
+        $count = array_push($this->queue, $item);
+
+        if ($wasEmpty) {
+            $this->resetFlushTimer();
+        }
+
+        if ($this->flush_interval === 0.0 || $count >= $this->batch_size || $this->flushIntervalElapsed()) {
+            return $this->flush(); // return ->flush() result: true on success
+        }
+
+        return true;
+    }
+
+    private function resetFlushTimer(): void
+    {
+        $this->flush_after = count($this->queue) > 0 && $this->flush_interval > 0
+            ? $this->now() + $this->flush_interval
+            : null;
+    }
+
+    private function flushIntervalElapsed(): bool
+    {
+        return $this->flush_after !== null && $this->now() >= $this->flush_after;
+    }
+
+    private function now(): float
+    {
+        return (float) Clock::get()->now()->format('U.u');
+    }
+
+    /**
+     * Encode a batch and enforce the transport-independent payload size limit.
+     *
+     * The limit applies to the raw JSON body, before transport-specific escaping,
+     * compression, or HTTP framing.
+     *
+     * @param array<int, array<string, mixed>> $batch Batch of messages to encode.
+     * @return string|false Encoded payload, or false when it cannot be sent.
+     */
+    protected function encodeBatchPayload($batch)
+    {
+        $payload = json_encode($this->payload($batch));
+        if (false === $payload) {
+            $this->handleError(json_last_error(), "Failed to encode batch payload: " . json_last_error_msg());
+            return false;
+        }
+
+        if ($this->payloadExceedsSizeLimit($payload)) {
+            return false;
+        }
+
+        return $payload;
+    }
+
+    /**
+     * Check a raw or transport-encoded payload against the batch size limit.
+     *
+     * @param string $payload Payload representation to measure.
+     * @return bool Whether the payload reaches or exceeds the limit.
+     */
+    protected function payloadExceedsSizeLimit($payload)
+    {
+        if (strlen($payload) < self::MAX_BATCH_PAYLOAD_SIZE) {
+            return false;
+        }
+
+        if ($this->debug()) {
+            $msg = "Message size is larger than " . self::MAX_BATCH_PAYLOAD_SIZE_HUMAN;
+            error_log("[Txlemetry][" . $this->type . "] " . $msg);
+        }
+
+        return true;
+    }
+
+    /**
+     * Given a batch of messages the method returns
+     * a valid payload.
+     *
+     * @param array<int, array<string, mixed>> $batch Batch of queued messages.
+     * @return array{batch: array<int, array<string, mixed>>, api_key: string}
+     */
+    protected function payload($batch)
+    {
+        return array(
+            "batch" => $batch,
+            "api_key" => $this->apiKey,
+        );
+    }
+
+    /**
+     * Get the SDK user agent.
+     *
+     * @return string User agent in the form of {library_name}/{library_version}.
+     */
+    protected function userAgent(): string
+    {
+        return Txlemetry::LIBRARY . "/" . Txlemetry::VERSION;
+    }
+}

@@ -1,0 +1,5 @@
+Txlemetry php SDK sources
+Derived from https://github.com/PostHog/posthog-php, tag 4.14.2, commit 950a336a71590ce4b2ae2b889a6a6c79f149f421.
+Original license files and author notices are retained.
+Public names, package identity, default hosts and distribution are maintained for Txlemetry.
+Candidate source migration and validation are in progress; no release has been published.

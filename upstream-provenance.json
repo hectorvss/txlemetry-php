@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/PostHog/posthog-php",
+  "tag": "4.14.2",
+  "commit": "950a336a71590ce4b2ae2b889a6a6c79f149f421",
+  "archiveSha256": "881a4ed531afda513c7fed83fcd52c0c6b3c8ea720cdcd8f297d217f63eb945b",
+  "releasePublishedAt": "2026-10-09T10:42:20Z",
+  "validation": "pending"
+}

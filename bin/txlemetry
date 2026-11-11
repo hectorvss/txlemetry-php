@@ -1,0 +1,154 @@
+#!/usr/bin/env php
+<?php
+
+require_once __DIR__ . '/../vendor/autoload.php';
+
+use Txlemetry\Txlemetry;
+
+if (in_array('--help', $argv, true)) {
+    print(usage());
+    exit;
+}
+
+date_default_timezone_set('UTC');
+
+$options = getopt(
+    '',
+    array(
+        'apiKey:',
+        'type:',
+        'host:',
+        'distinctId:',
+        'event:',
+        'properties:',
+        'alias:',
+        'groupType:',
+        'groupKey:',
+        'no-ssl',
+        'debug',
+        'flag:'
+    )
+);
+
+if (empty($options['apiKey'])) {
+    error('apiKey flag required');
+}
+
+$initOptions = array(
+    'debug' => array_key_exists('debug', $options),
+);
+
+if (array_key_exists('host', $options)) {
+    $initOptions['host'] = $options['host'];
+}
+
+if (array_key_exists('no-ssl', $options)) {
+    $initOptions['ssl'] = false;
+}
+
+Txlemetry::init(
+    $options['apiKey'],
+    $initOptions
+);
+
+switch ($options['type']) {
+    case 'capture':
+        Txlemetry::capture(
+            array(
+                'distinctId' => $options['distinctId'],
+                'event' => $options['event'],
+                'properties' => parse_json($options['properties'])
+            )
+        );
+        break;
+
+    case 'identify':
+        Txlemetry::identify(
+            array(
+                'distinctId' => $options['distinctId'],
+                'properties' => parse_json($options['properties'])
+            )
+        );
+        break;
+
+    case 'alias':
+        Txlemetry::alias(
+            array(
+                'distinctId' => $options['distinctId'],
+                'alias' => $options['alias']
+            )
+        );
+        break;
+
+    case 'groupIdentify':
+        $message = array(
+            'groupType' => $options['groupType'],
+            'groupKey' => $options['groupKey'],
+            'properties' => parse_json($options['properties'])
+        );
+        if (!empty($options['distinctId'])) {
+            $message['distinctId'] = $options['distinctId'];
+        }
+        Txlemetry::groupIdentify($message);
+        break;
+
+    case 'getFeatureFlag':
+        $result = Txlemetry::getFeatureFlag($options['flag'] ?? 'test-flag', $options['distinctId'] ?? "test-distinct-id");
+        echo "RESULT: ";
+        var_dump($result);
+        break;
+
+    case 'getFeatureFlagPayload':
+        $result = Txlemetry::getFeatureFlagPayload($options['flag'] ?? 'test-flag', $options['distinctId'] ?? "test-distinct-id");
+        echo "RESULT: ";
+        var_dump($result);
+        break;
+
+    default:
+        error(usage());
+        break;
+}
+
+Txlemetry::flush();
+
+function usage(): string
+{
+    return "\n  Common keys:" .
+        "\n    --apiKey KEY" .
+        "\n    --host HOST" .
+        "\n    --debug" .
+        "\n    --no-ssl" .
+        "\n" .
+        "\n  Usage:" .
+        "\n    txlemetry --type capture --distinctId \"id\" --event \"event name\" --properties '{ \"json\": \"object\" }'" .
+        "\n    txlemetry --type identify --distinctId \"id\" --properties '{ \"json\": \"object\" }'" .
+        "\n    txlemetry --type alias --distinctId \"id\" --alias \"alias\"" .
+        "\n    txlemetry --type groupIdentify --groupType \"organization\" --groupKey \"id:5\" --distinctId \"user-id\" --properties '{ \"json\": \"object\" }'" .
+        "\n    txlemetry --type getFeatureFlag --flag some-flag --apiKey phc_... --host localhost:8010 --no-ssl" .
+        "\n    txlemetry --type getFeatureFlag --flag some-flag --apiKey phc_... --host localhost:8010 --no-ssl" .
+        "\n\n\n";
+}
+
+function error($message)
+{
+    print("$message\n\n");
+    exit(1);
+}
+
+function parse_json($input)
+{
+    if (empty($input)) {
+        return null;
+    }
+
+    return json_decode($input, true);
+}
+
+function parse_timestamp($input)
+{
+    if (empty($input)) {
+        return null;
+    }
+
+    return strtotime($input);
+}

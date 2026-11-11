@@ -1,0 +1,27 @@
+FROM php:8.3-cli
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git unzip curl gzip python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+COPY composer.json composer.lock /app/
+COPY lib/ /app/lib/
+COPY bin/ /app/bin/
+
+RUN composer install --no-interaction --prefer-dist --no-dev --no-progress
+
+COPY sdk_compliance_adapter/ /app/sdk_compliance_adapter/
+
+RUN php -r 'exit(extension_loaded("curl") ? 0 : 1);'
+
+ENV TXLEMETRY_CONSUMER=fork_curl
+
+RUN PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s sdk_compliance_adapter -p 'test_*.py' -v
+
+EXPOSE 8080
+
+CMD ["python3", "/app/sdk_compliance_adapter/server.py"]

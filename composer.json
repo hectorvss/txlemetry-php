@@ -1,0 +1,63 @@
+{
+  "name": "txlemetry/txlemetry-php",
+  "version": "5.0.0",
+  "description": "Txlemetry PHP SDK",
+  "keywords": [
+    "txlemetry",
+    "analytics",
+    "feature-flags"
+  ],
+  "homepage": "https://txlemetry.com",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "PostHog <engineering@posthog.com>",
+      "homepage": "https://posthog.com/"
+    }
+  ],
+  "require": {
+    "ext-json": "*",
+    "php": ">=8.2",
+    "symfony/clock": "^6.2|^7.0|^8.0",
+    "symfony/polyfill-mbstring": "^1.31",
+    "symfony/polyfill-iconv": "^1.31"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^11.0",
+    "squizlabs/php_codesniffer": "^4.0",
+    "ext-zlib": "*"
+  },
+  "autoload": {
+    "psr-4": {
+      "Txlemetry\\": "lib/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Txlemetry\\Test\\": "test/",
+      "Txlemetry\\Test\\Assets\\": "test/assests"
+    }
+  },
+  "scripts": {
+    "api:check": "@php scripts/check-public-api.php",
+    "api:update": "@php scripts/check-public-api.php --update"
+  },
+  "bin": [
+    "bin/txlemetry"
+  ],
+  "archive": {
+    "exclude": [
+      "/vendor",
+      "/test",
+      "/composer.lock",
+      "/phpunit.xml",
+      "/phpcs.xml",
+      "/Makefile",
+      "/.github",
+      "/.phpunit.cache",
+      "/.phpunit.result.cache",
+      "/clover.xml",
+      "/.env"
+    ]
+  }
+}

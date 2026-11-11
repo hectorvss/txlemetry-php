@@ -1,0 +1,1254 @@
+<?php
+
+namespace Txlemetry;
+
+use Symfony\Component\Clock\Clock;
+
+/**
+ * Local feature flag matching helpers.
+ *
+ * @internal
+ */
+class FeatureFlag
+{
+    private const LONG_SCALE = 0xfffffffffffffff;
+
+    /**
+     * Match a single property filter against provided property values.
+     *
+     * @param array<string, mixed> $property Feature flag property filter.
+     * @param array<string, mixed> $propertyValues Available property values keyed by property name.
+     * @param mixed $propertyMatchingVersion Definition snapshot selector; only 2 enables explicit matching.
+     * @return bool Whether the property matches.
+     * @throws InconclusiveMatchException When the property cannot be evaluated locally.
+     */
+    public static function matchProperty($property, $propertyValues, $propertyMatchingVersion = 1)
+    {
+        $key = $property["key"];
+        $operator = $property["operator"] ?? "exact";
+        $value = $property["value"];
+
+        if (!array_key_exists($key, $propertyValues)) {
+            throw new InconclusiveMatchException("Can't match properties without a given property value");
+        }
+
+        if ($operator == "is_not_set") {
+            return false;
+        }
+
+        $overrideValue = $propertyValues[$key];
+
+        if ($operator == "exact") {
+            return FeatureFlag::computeExactMatch($value, $overrideValue, $propertyMatchingVersion);
+        }
+
+        if ($operator == "is_not") {
+            return !FeatureFlag::computeExactMatch($value, $overrideValue, $propertyMatchingVersion);
+        }
+
+        if ($operator == "is_set") {
+            return array_key_exists($key, $propertyValues);
+        }
+
+        if ($operator == "icontains") {
+            return strpos(strtolower(FeatureFlag::valueToString($overrideValue)), strtolower(FeatureFlag::valueToString($value))) !== false;
+        }
+
+        if ($operator == "not_icontains") {
+            return strpos(strtolower(FeatureFlag::valueToString($overrideValue)), strtolower(FeatureFlag::valueToString($value))) === false;
+        }
+
+        if ($operator == "starts_with") {
+            return str_starts_with(strtolower(FeatureFlag::valueToString($overrideValue)), strtolower(FeatureFlag::valueToString($value)));
+        }
+
+        if ($operator == "not_starts_with") {
+            return !str_starts_with(strtolower(FeatureFlag::valueToString($overrideValue)), strtolower(FeatureFlag::valueToString($value)));
+        }
+
+        if ($operator == "ends_with") {
+            return str_ends_with(strtolower(FeatureFlag::valueToString($overrideValue)), strtolower(FeatureFlag::valueToString($value)));
+        }
+
+        if ($operator == "not_ends_with") {
+            return !str_ends_with(strtolower(FeatureFlag::valueToString($overrideValue)), strtolower(FeatureFlag::valueToString($value)));
+        }
+
+        if (in_array($operator, ["regex", "not_regex"])) {
+            $regexValue = FeatureFlag::prepareValueForRegex($value);
+            if (FeatureFlag::isRegularExpression($regexValue)) {
+                if ($overrideValue === null) {
+                    return false;
+                }
+                $returnValue = preg_match($regexValue, $overrideValue) ? true : false;
+                if ($operator == "regex") {
+                    return $returnValue;
+                } else {
+                    return !$returnValue;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        if (in_array($operator, ["gt", "gte", "lt", "lte"])) {
+            $parsedValue = null;
+
+            if (is_numeric($value)) {
+                $parsedValue = floatval($value);
+            }
+
+            if (!is_null($parsedValue) && !is_null($overrideValue)) {
+                if (is_string($overrideValue)) {
+                    return FeatureFlag::compare($overrideValue, FeatureFlag::valueToString($value), $operator);
+                } else {
+                    return FeatureFlag::compare($overrideValue, $parsedValue, $operator, "numeric");
+                }
+            } else {
+                // Preserve the existing fallback for non-numeric comparison values.
+                return FeatureFlag::compare(strval($overrideValue), strval($value), $operator);
+            }
+        }
+
+        if (in_array($operator, ["is_date_before", "is_date_after"])) {
+            $parsedDate = FeatureFlag::relativeDateParseForFeatureFlagMatching($value);
+
+            if (is_null($parsedDate)) {
+                $parsedDate = FeatureFlag::convertToDateTime($value);
+            }
+
+            if (is_null($parsedDate)) {
+                throw new InconclusiveMatchException("The date set on the flag is not a valid format");
+            }
+
+            $overrideDate = FeatureFlag::convertToDateTime($overrideValue);
+            if ($operator == 'is_date_before') {
+                return $overrideDate < $parsedDate;
+            } else {
+                return $overrideDate > $parsedDate;
+            }
+        }
+
+        // Semver operators
+        if (in_array($operator, ["semver_eq", "semver_neq", "semver_gt", "semver_gte", "semver_lt", "semver_lte"])) {
+            $overrideTuple = FeatureFlag::parseSemver($overrideValue);
+            $valueTuple = FeatureFlag::parseSemver($value);
+
+            $comparison = FeatureFlag::compareSemverTuples($overrideTuple, $valueTuple);
+
+            if ($operator === "semver_eq") {
+                return $comparison === 0;
+            } elseif ($operator === "semver_neq") {
+                return $comparison !== 0;
+            } elseif ($operator === "semver_gt") {
+                return $comparison > 0;
+            } elseif ($operator === "semver_gte") {
+                return $comparison >= 0;
+            } elseif ($operator === "semver_lt") {
+                return $comparison < 0;
+            } elseif ($operator === "semver_lte") {
+                return $comparison <= 0;
+            }
+        }
+
+        if ($operator === "semver_tilde") {
+            $overrideTuple = FeatureFlag::parseSemver($overrideValue);
+            list($lower, $upper) = FeatureFlag::tildeBounds($value);
+
+            return FeatureFlag::compareSemverTuples($overrideTuple, $lower) >= 0
+                && FeatureFlag::compareSemverTuples($overrideTuple, $upper) < 0;
+        }
+
+        if ($operator === "semver_caret") {
+            $overrideTuple = FeatureFlag::parseSemver($overrideValue);
+            list($lower, $upper) = FeatureFlag::caretBounds($value);
+
+            return FeatureFlag::compareSemverTuples($overrideTuple, $lower) >= 0
+                && FeatureFlag::compareSemverTuples($overrideTuple, $upper) < 0;
+        }
+
+        if ($operator === "semver_wildcard") {
+            $overrideTuple = FeatureFlag::parseSemver($overrideValue);
+            list($lower, $upper) = FeatureFlag::wildcardBounds($value);
+
+            return FeatureFlag::compareSemverTuples($overrideTuple, $lower) >= 0
+                && FeatureFlag::compareSemverTuples($overrideTuple, $upper) < 0;
+        }
+
+        throw new InconclusiveMatchException("Unknown operator: " . $operator);
+    }
+
+    /**
+     * Match a cohort property filter against provided property values.
+     *
+     * @param array<string, mixed> $property Cohort property filter.
+     * @param array<string, mixed> $propertyValues Available property values keyed by property name.
+     * @param array<string, mixed> $cohortProperties Local cohort definitions keyed by cohort ID.
+     * @param array<string, array<string, mixed>>|null $flagsByKey Local feature flag definitions keyed by key.
+     * @param array<string, mixed>|null $evaluationCache Cache used for flag dependency evaluation.
+     * @param string|null $distinctId Distinct ID used for nested flag dependency evaluation.
+     * @param mixed $propertyMatchingVersion Definition snapshot selector; defaults to legacy matching.
+     * @return bool Whether the cohort matches.
+     * @throws RequiresServerEvaluationException When the cohort requires server-side data.
+     * @throws InconclusiveMatchException When the cohort cannot be evaluated locally.
+     */
+    public static function matchCohort(
+        $property,
+        $propertyValues,
+        $cohortProperties,
+        $flagsByKey = null,
+        $evaluationCache = null,
+        $distinctId = null,
+        $propertyMatchingVersion = 1
+    ) {
+        $cohortId = strval($property["value"]);
+        if (!array_key_exists($cohortId, $cohortProperties)) {
+            throw new RequiresServerEvaluationException(
+                "cohort {$cohortId} not found in local cohorts - " .
+                "likely a static cohort that requires server evaluation"
+            );
+        }
+
+        $propertyGroup = $cohortProperties[$cohortId];
+        return FeatureFlag::matchPropertyGroup(
+            $propertyGroup,
+            $propertyValues,
+            $cohortProperties,
+            $flagsByKey,
+            $evaluationCache,
+            $distinctId,
+            $propertyMatchingVersion
+        );
+    }
+
+    /**
+     * Match a property group against provided property values.
+     *
+     * @param array<string, mixed>|null $propertyGroup Property group definition.
+     * @param array<string, mixed> $propertyValues Available property values keyed by property name.
+     * @param array<string, mixed> $cohortProperties Local cohort definitions keyed by cohort ID.
+     * @param array<string, array<string, mixed>>|null $flagsByKey Local feature flag definitions keyed by key.
+     * @param array<string, mixed>|null $evaluationCache Cache used for flag dependency evaluation.
+     * @param string|null $distinctId Distinct ID used for nested flag dependency evaluation.
+     * @param mixed $propertyMatchingVersion Definition snapshot selector; defaults to legacy matching.
+     * @return bool Whether the property group matches.
+     * @throws RequiresServerEvaluationException When server-side data is required.
+     * @throws InconclusiveMatchException When the group cannot be evaluated locally.
+     */
+    public static function matchPropertyGroup(
+        $propertyGroup,
+        $propertyValues,
+        $cohortProperties,
+        $flagsByKey = null,
+        $evaluationCache = null,
+        $distinctId = null,
+        $propertyMatchingVersion = 1
+    ) {
+        if (!$propertyGroup) {
+            return true;
+        }
+
+        $propertyGroupType = $propertyGroup["type"];
+        $properties = $propertyGroup["values"];
+
+        if (!$properties || count($properties) === 0) {
+            // empty groups are no-ops, always match
+            return true;
+        }
+
+        $errorMatchingLocally = false;
+
+        if (array_key_exists("values", $properties[0])) {
+            // a nested property group
+            foreach ($properties as $prop) {
+                try {
+                    $matches = FeatureFlag::matchPropertyGroup(
+                        $prop,
+                        $propertyValues,
+                        $cohortProperties,
+                        $flagsByKey,
+                        $evaluationCache,
+                        $distinctId,
+                        $propertyMatchingVersion
+                    );
+                    if ($propertyGroupType === 'AND') {
+                        if (!$matches) {
+                            return false;
+                        }
+                    } else {
+                        // OR group
+                        if ($matches) {
+                            return true;
+                        }
+                    }
+                } catch (RequiresServerEvaluationException $err) {
+                    // Immediately propagate - this condition requires server-side data
+                    throw $err;
+                } catch (InconclusiveMatchException $err) {
+                    $errorMatchingLocally = true;
+                }
+            }
+
+            if ($errorMatchingLocally) {
+                throw new InconclusiveMatchException("Can't match cohort without a given cohort property value");
+            }
+            // if we get here, all matched in AND case, or none matched in OR case
+            return $propertyGroupType === 'AND';
+        } else {
+            foreach ($properties as $prop) {
+                try {
+                    $matches = false;
+                    $propType = $prop["type"] ?? null;
+                    if ($propType === 'cohort') {
+                        $matches = FeatureFlag::matchCohort(
+                            $prop,
+                            $propertyValues,
+                            $cohortProperties,
+                            $flagsByKey,
+                            $evaluationCache,
+                            $distinctId,
+                            $propertyMatchingVersion
+                        );
+                    } elseif ($propType === 'flag') {
+                        $matches = FeatureFlag::evaluateFlagDependency(
+                            $prop,
+                            $flagsByKey,
+                            $evaluationCache,
+                            $distinctId,
+                            $propertyValues,
+                            $cohortProperties,
+                            $propertyMatchingVersion
+                        );
+                    } else {
+                        $matches = FeatureFlag::matchProperty($prop, $propertyValues, $propertyMatchingVersion);
+                    }
+
+                    $negation = $prop["negation"] ?? false;
+
+                    if ($propertyGroupType === 'AND') {
+                        // if negated property, do the inverse
+                        if (!$matches && !$negation) {
+                            return false;
+                        }
+                        if ($matches && $negation) {
+                            return false;
+                        }
+                    } else {
+                        // OR group
+                        if ($matches && !$negation) {
+                            return true;
+                        }
+                        if (!$matches && $negation) {
+                            return true;
+                        }
+                    }
+                } catch (RequiresServerEvaluationException $err) {
+                    // Immediately propagate - this condition requires server-side data
+                    throw $err;
+                } catch (InconclusiveMatchException $err) {
+                    // If this is a flag dependency error, preserve the original message
+                    if ($propType === 'flag') {
+                        throw $err;
+                    }
+                    $errorMatchingLocally = true;
+                }
+            }
+
+            if ($errorMatchingLocally) {
+                throw new InconclusiveMatchException("can't match cohort without a given cohort property value");
+            }
+
+            // if we get here, all matched in AND case, or none matched in OR case
+            return $propertyGroupType === 'AND';
+        }
+    }
+
+    /**
+     * Parse a Txlemetry relative date string for feature flag matching.
+     *
+     * @param mixed $value Relative date string such as `1h`, `7d`, `2w`, `3m`, or `1y`.
+     * @return \DateTime|null Parsed UTC date, or null when the value is invalid.
+     */
+    public static function relativeDateParseForFeatureFlagMatching($value)
+    {
+        $regex = "/^-?(?<number>[0-9]+)(?<interval>[a-z])$/";
+        $parsedDt = \DateTime::createFromInterface(Clock::get()->now())->setTimezone(new \DateTimeZone("UTC"));
+        if (preg_match($regex, $value, $matches)) {
+            $number = intval($matches["number"]);
+
+            if ($number >= 10_000) {
+                // Guard against overflow, disallow numbers greater than 10_000
+                return null;
+            }
+
+            $interval = $matches["interval"];
+            if ($interval == "h") {
+                $parsedDt->sub(new \DateInterval("PT{$number}H"));
+            } elseif ($interval == "d") {
+                $parsedDt->sub(new \DateInterval("P{$number}D"));
+            } elseif ($interval == "w") {
+                $parsedDt->sub(new \DateInterval("P{$number}W"));
+            } elseif ($interval == "m") {
+                $parsedDt->sub(new \DateInterval("P{$number}M"));
+            } elseif ($interval == "y") {
+                $parsedDt->sub(new \DateInterval("P{$number}Y"));
+            } else {
+                return null;
+            }
+
+            return $parsedDt;
+        } else {
+            return null;
+        }
+    }
+
+    /**
+     * Parse a semver numeric identifier (e.g., the "1" in "1.2.3").
+     *
+     * @throws InconclusiveMatchException If the part is empty, non-numeric, or has a leading zero.
+     */
+    private static function parseSemverNumeric(string $part, string $component, $value): int
+    {
+        // Semver 2.0.0 §2: numeric identifiers MUST NOT include leading zeros.
+        if ($part === "" || !ctype_digit($part)) {
+            throw new InconclusiveMatchException("Cannot parse semver: invalid {$component} version in {$value}");
+        }
+        if (strlen($part) > 1 && $part[0] === "0") {
+            throw new InconclusiveMatchException("Cannot parse semver: {$component} version has leading zero in {$value}");
+        }
+        return intval($part);
+    }
+
+    /**
+     * Parse a semver string into a tuple of [major, minor, patch].
+     *
+     * Rules:
+     * 1. Strip leading/trailing whitespace
+     * 2. Strip `v` or `V` prefix (e.g., "v1.2.3" → "1.2.3")
+     * 3. Strip pre-release and build metadata suffixes (split on `-` or `+`, take first part)
+     * 4. Split on `.` and parse first 3 components as integers
+     * 5. Default missing components to 0 (e.g., "1.2" → (1, 2, 0), "1" → (1, 0, 0))
+     * 6. Ignore extra components beyond the third (e.g., "1.2.3.4" → (1, 2, 3))
+     * 7. Reject numeric identifiers with leading zeros per semver 2.0.0 §2
+     * 8. Throw InconclusiveMatchException for invalid input (empty string, non-numeric parts, leading dot)
+     *
+     * @param mixed $value The semver string to parse
+     * @return array{int, int, int} The parsed tuple [major, minor, patch]
+     * @throws InconclusiveMatchException If the value cannot be parsed as semver
+     */
+    public static function parseSemver($value): array
+    {
+        if ($value === null || $value === "") {
+            throw new InconclusiveMatchException("Cannot parse empty or null value as semver");
+        }
+
+        $text = trim(strval($value));
+
+        if ($text === "") {
+            throw new InconclusiveMatchException("Cannot parse empty value as semver");
+        }
+
+        // Strip v/V prefix
+        $text = ltrim($text, "vV");
+
+        if ($text === "") {
+            throw new InconclusiveMatchException("Cannot parse semver: only prefix found");
+        }
+
+        // Strip pre-release and build metadata (split on - or +, take first part)
+        $text = preg_split('/[-+]/', $text, 2)[0];
+
+        // Check for leading dot
+        if (str_starts_with($text, ".")) {
+            throw new InconclusiveMatchException("Cannot parse semver with leading dot: {$value}");
+        }
+
+        // Split on dots
+        $parts = explode(".", $text);
+
+        $major = FeatureFlag::parseSemverNumeric($parts[0] ?? "", "major", $value);
+
+        $minor = 0;
+        if (isset($parts[1]) && $parts[1] !== "") {
+            $minor = FeatureFlag::parseSemverNumeric($parts[1], "minor", $value);
+        }
+
+        $patch = 0;
+        if (isset($parts[2]) && $parts[2] !== "") {
+            $patch = FeatureFlag::parseSemverNumeric($parts[2], "patch", $value);
+        }
+
+        return [$major, $minor, $patch];
+    }
+
+    /**
+     * Compare two semver tuples.
+     *
+     * @param array{int, int, int} $a First tuple
+     * @param array{int, int, int} $b Second tuple
+     * @return int -1 if a < b, 0 if a == b, 1 if a > b
+     */
+    private static function compareSemverTuples(array $a, array $b): int
+    {
+        if ($a[0] !== $b[0]) {
+            return $a[0] <=> $b[0];
+        }
+        if ($a[1] !== $b[1]) {
+            return $a[1] <=> $b[1];
+        }
+        return $a[2] <=> $b[2];
+    }
+
+    /**
+     * Calculate tilde bounds for semver matching.
+     * ~X.Y.Z means >=X.Y.Z and <X.(Y+1).0
+     *
+     * @param mixed $value The semver pattern
+     * @return array{array{int, int, int}, array{int, int, int}} [lower, upper] bounds
+     */
+    private static function tildeBounds($value): array
+    {
+        $tuple = FeatureFlag::parseSemver($value);
+        $lower = $tuple;
+        $upper = [$tuple[0], $tuple[1] + 1, 0];
+        return [$lower, $upper];
+    }
+
+    /**
+     * Calculate caret bounds for semver matching.
+     * ^X.Y.Z where:
+     * - X > 0: >=X.Y.Z <(X+1).0.0
+     * - X == 0, Y > 0: >=0.Y.Z <0.(Y+1).0
+     * - X == 0, Y == 0: >=0.0.Z <0.0.(Z+1)
+     *
+     * @param mixed $value The semver pattern
+     * @return array{array{int, int, int}, array{int, int, int}} [lower, upper] bounds
+     */
+    private static function caretBounds($value): array
+    {
+        $tuple = FeatureFlag::parseSemver($value);
+        $lower = $tuple;
+
+        if ($tuple[0] > 0) {
+            $upper = [$tuple[0] + 1, 0, 0];
+        } elseif ($tuple[1] > 0) {
+            $upper = [0, $tuple[1] + 1, 0];
+        } else {
+            $upper = [0, 0, $tuple[2] + 1];
+        }
+
+        return [$lower, $upper];
+    }
+
+    /**
+     * Calculate wildcard bounds for semver matching.
+     * X.Y.* means >=X.Y.0 <X.(Y+1).0
+     * X.* means >=X.0.0 <(X+1).0.0
+     *
+     * @param mixed $value The semver pattern with wildcard
+     * @return array{array{int, int, int}, array{int, int, int}} [lower, upper] bounds
+     */
+    private static function wildcardBounds($value): array
+    {
+        if ($value === null || $value === "") {
+            throw new InconclusiveMatchException("Cannot parse empty or null value as semver wildcard");
+        }
+
+        $text = trim(strval($value));
+
+        // Strip v/V prefix
+        $text = ltrim($text, "vV");
+
+        // Split on dots
+        $parts = explode(".", $text);
+
+        // Remove trailing wildcard parts and empty parts
+        while (count($parts) > 0 && (end($parts) === "*" || end($parts) === "x" || end($parts) === "X" || end($parts) === "")) {
+            array_pop($parts);
+        }
+
+        if (count($parts) === 0) {
+            throw new InconclusiveMatchException("Cannot parse semver wildcard: no version components found in {$value}");
+        }
+
+        $major = FeatureFlag::parseSemverNumeric($parts[0], "major", $value);
+
+        if (count($parts) === 1) {
+            // X.* pattern
+            $lower = [$major, 0, 0];
+            $upper = [$major + 1, 0, 0];
+        } else {
+            // X.Y.* pattern
+            $minor = FeatureFlag::parseSemverNumeric($parts[1], "minor", $value);
+            $lower = [$major, $minor, 0];
+            $upper = [$major, $minor + 1, 0];
+        }
+
+        return [$lower, $upper];
+    }
+
+    private static function convertToDateTime($value)
+    {
+        if ($value instanceof \DateTime) {
+            return $value;
+        } elseif (is_string($value)) {
+            try {
+                $date = new \DateTime($value);
+                if (!is_nan($date->getTimestamp())) {
+                    return $date;
+                }
+            } catch (Exception $e) {
+                throw new InconclusiveMatchException("{$value} is in an invalid date format");
+            }
+        } else {
+            throw new InconclusiveMatchException("The date provided {$value} must be a string or date object");
+        }
+    }
+
+    private static function computeExactMatch($value, $overrideValue, $propertyMatchingVersion)
+    {
+        if ($propertyMatchingVersion !== 2 && FeatureFlag::isTruthyOrFalsyPropertyValue($value)) {
+            return FeatureFlag::isTruthyPropertyValue($value) === FeatureFlag::isTruthyPropertyValue($overrideValue);
+        }
+
+        if ($value === []) {
+            return FeatureFlag::isTruthyPropertyValue($overrideValue);
+        }
+
+        $overrideString = FeatureFlag::unicodeLowercase(FeatureFlag::valueToString($overrideValue));
+        if (is_array($value) && array_is_list($value)) {
+            foreach ($value as $candidate) {
+                if (FeatureFlag::unicodeLowercase(FeatureFlag::valueToString($candidate)) === $overrideString) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return FeatureFlag::unicodeLowercase(FeatureFlag::valueToString($value)) === $overrideString;
+    }
+
+    private static function isTruthyOrFalsyPropertyValue($value)
+    {
+        if (is_bool($value)) {
+            return true;
+        }
+        if (is_string($value)) {
+            return in_array(strtolower($value), ["true", "false"], true);
+        }
+        if (is_array($value) && array_is_list($value)) {
+            foreach ($value as $candidate) {
+                if (!FeatureFlag::isTruthyOrFalsyPropertyValue($candidate)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private static function isTruthyPropertyValue($value)
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_string($value)) {
+            return strtolower($value) === "true";
+        }
+        if (is_array($value) && array_is_list($value)) {
+            foreach ($value as $candidate) {
+                if (!FeatureFlag::isTruthyPropertyValue($candidate)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private static function unicodeLowercase($value)
+    {
+        $mode = defined('MB_CASE_LOWER_SIMPLE') ? MB_CASE_LOWER_SIMPLE : MB_CASE_LOWER;
+        $characters = preg_split('//u', $value, -1, PREG_SPLIT_NO_EMPTY);
+        if ($characters === false) {
+            return mb_convert_case($value, $mode, "UTF-8");
+        }
+
+        foreach ($characters as $index => $character) {
+            if ($character !== "Σ") {
+                continue;
+            }
+
+            // PHP 8.2+'s PCRE2 supports the Cased and Case_Ignorable
+            // derived properties used by Unicode's Final_Sigma rule.
+            $precededByCased = false;
+            for ($before = $index - 1; $before >= 0; $before--) {
+                if (preg_match('/^\p{Case_Ignorable}$/u', $characters[$before])) {
+                    continue;
+                }
+                $precededByCased = preg_match('/^\p{Cased}$/u', $characters[$before]) === 1;
+                break;
+            }
+
+            $followedByCased = false;
+            for ($after = $index + 1; $after < count($characters); $after++) {
+                if (preg_match('/^\p{Case_Ignorable}$/u', $characters[$after])) {
+                    continue;
+                }
+                $followedByCased = preg_match('/^\p{Cased}$/u', $characters[$after]) === 1;
+                break;
+            }
+
+            $characters[$index] = $precededByCased && !$followedByCased ? "ς" : "σ";
+        }
+
+        // U+0130 is the unconditional multi-code-point lowercase mapping that
+        // PHP's simple mode omits.
+        $value = str_replace("\u{0130}", "i\u{0307}", implode('', $characters));
+        return mb_convert_case($value, $mode, "UTF-8");
+    }
+
+    private static function valueToString($value)
+    {
+        if (is_string($value)) {
+            return $value;
+        }
+        if (is_bool($value)) {
+            return $value ? "true" : "false";
+        }
+        if (is_null($value)) {
+            return "null";
+        }
+        if (is_float($value)) {
+            return FeatureFlag::floatToString($value);
+        }
+        if (is_array($value) || is_object($value)) {
+            return FeatureFlag::jsonValueToString($value);
+        }
+        return strval($value);
+    }
+
+    private static function jsonValueToString($value)
+    {
+        $jsonFlags = JSON_UNESCAPED_LINE_TERMINATORS
+            | JSON_UNESCAPED_SLASHES
+            | JSON_UNESCAPED_UNICODE
+            | JSON_THROW_ON_ERROR;
+
+        if (is_string($value)) {
+            return json_encode($value, $jsonFlags);
+        }
+        if (is_bool($value)) {
+            return $value ? "true" : "false";
+        }
+        if (is_null($value)) {
+            return "null";
+        }
+        if (is_float($value)) {
+            return FeatureFlag::floatToString($value);
+        }
+        if (is_int($value)) {
+            return strval($value);
+        }
+        if ($value instanceof \JsonSerializable) {
+            return FeatureFlag::jsonValueToString($value->jsonSerialize());
+        }
+        if (is_object($value)) {
+            $value = get_object_vars($value);
+            $isList = false;
+        } else {
+            $isList = array_is_list($value);
+        }
+
+        if ($isList) {
+            $items = array_map(fn($item) => FeatureFlag::jsonValueToString($item), $value);
+            return '[' . implode(',', $items) . ']';
+        }
+
+        ksort($value, SORT_STRING);
+        $items = [];
+        foreach ($value as $key => $item) {
+            $encodedKey = json_encode(strval($key), $jsonFlags);
+            $items[] = $encodedKey . ':' . FeatureFlag::jsonValueToString($item);
+        }
+        return '{' . implode(',', $items) . '}';
+    }
+
+    private static function floatToString($value)
+    {
+        if (!is_finite($value)) {
+            return strval($value);
+        }
+
+        $encoded = json_encode($value, JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR);
+        if ($value == 0.0) {
+            return str_starts_with($encoded, '-') ? "-0.0" : "0.0";
+        }
+
+        preg_match('/^(-?)(\d+)(?:\.(\d+))?(?:e([+-]?\d+))?$/i', $encoded, $parts);
+        $sign = $parts[1];
+        $integer = $parts[2];
+        $fraction = $parts[3] ?? '';
+        $encodedExponent = intval($parts[4] ?? 0);
+        $digits = $integer . $fraction;
+        $firstNonZero = strspn($digits, '0');
+        $digits = rtrim(substr($digits, $firstNonZero), '0');
+        $decimalPosition = strlen($integer) + $encodedExponent;
+        $exponent = $decimalPosition - $firstNonZero - 1;
+
+        if ($exponent >= 16 || $exponent <= -6) {
+            $mantissa = $digits[0];
+            if (strlen($digits) > 1) {
+                $mantissa .= '.' . substr($digits, 1);
+            }
+            return $sign . $mantissa . 'e' . ($exponent >= 0 ? '+' : '') . $exponent;
+        }
+
+        $position = $exponent + 1;
+        if ($position <= 0) {
+            return $sign . '0.' . str_repeat('0', -$position) . $digits;
+        }
+        if ($position >= strlen($digits)) {
+            return $sign . $digits . str_repeat('0', $position - strlen($digits)) . '.0';
+        }
+        return $sign . substr($digits, 0, $position) . '.' . substr($digits, $position);
+    }
+
+    private static function compare($lhs, $rhs, $operator, $type = "string")
+    {
+        // If type is string, we use strcmp to compare the two strings
+        // If type is numeric, we use <=> to compare the two numbers
+
+        if ($type == "string") {
+            $comparison = strcmp($lhs, $rhs);
+        } else {
+            $comparison = $lhs <=> $rhs;
+        }
+
+        if ($operator == "gt") {
+            return $comparison > 0;
+        } elseif ($operator == "gte") {
+            return $comparison >= 0;
+        } elseif ($operator == "lt") {
+            return $comparison < 0;
+        } elseif ($operator == "lte") {
+            return $comparison <= 0;
+        }
+
+        throw new \Exception("Invalid operator: " . $operator);
+    }
+
+    private static function hash($key, $distinctId, $salt = "")
+    {
+        $hashKey = sprintf("%s.%s%s", $key, $distinctId, $salt);
+        $hashVal = base_convert(substr(sha1($hashKey), 0, 15), 16, 10);
+
+        return $hashVal / self::LONG_SCALE;
+    }
+
+    private static function getMatchingVariant($flag, $distinctId)
+    {
+        $variants = FeatureFlag::variantLookupTable($flag);
+
+        foreach ($variants as $variant) {
+            if (
+                FeatureFlag::hash($flag["key"], $distinctId, "variant") >= $variant["value_min"]
+                && FeatureFlag::hash($flag["key"], $distinctId, "variant") < $variant["value_max"]
+            ) {
+                return $variant["key"];
+            }
+        }
+
+        return null;
+    }
+
+    private static function variantLookupTable($featureFlag)
+    {
+        $lookupTable = [];
+        $valueMin = 0;
+        $multivariates = (($featureFlag['filters'] ?? [])['multivariate'] ?? [])['variants'] ?? [];
+
+        foreach ($multivariates as $variant) {
+            $valueMax = $valueMin + $variant["rollout_percentage"] / 100;
+
+            array_push($lookupTable, [
+                "value_min" => $valueMin,
+                "value_max" => $valueMax,
+                "key" => $variant["key"]
+            ]);
+            $valueMin = $valueMax;
+        }
+
+        return $lookupTable;
+    }
+
+    /**
+     * Match a full feature flag definition for a distinct id and properties.
+     *
+     * @param array<string, mixed> $flag Feature flag definition.
+     * @param string $distinctId Distinct ID or group key used for bucketing.
+     * @param array<string, mixed> $properties Person or group properties for evaluation.
+     * @param array<string, mixed> $cohorts Local cohort definitions keyed by cohort ID.
+     * @param array<string, array<string, mixed>>|null $flagsByKey Local feature flag definitions keyed by key.
+     * @param array<string, mixed>|null $evaluationCache Cache used for flag dependency evaluation.
+     * @param array<string, mixed> $groups Group identifiers for group-based flags.
+     * @param array<string, array<string, mixed>> $groupProperties Group properties for evaluation.
+     * @param array<string, string> $groupTypeMapping Mapping from group type index to group type name.
+     * @param mixed $propertyMatchingVersion Definition snapshot selector; defaults to legacy matching.
+     * @return bool|string False for disabled, true for enabled boolean flags, or variant key.
+     * @throws RequiresServerEvaluationException When server-side data is required.
+     * @throws InconclusiveMatchException When the flag cannot be evaluated locally.
+     */
+    public static function matchFeatureFlagProperties(
+        $flag,
+        $distinctId,
+        $properties,
+        $cohorts = [],
+        $flagsByKey = null,
+        $evaluationCache = null,
+        $groups = [],
+        $groupProperties = [],
+        $groupTypeMapping = [],
+        $propertyMatchingVersion = 1
+    ) {
+        $flagFilters = $flag["filters"] ?? [];
+        $flagConditions = $flagFilters["groups"] ?? [];
+        $flagAggregation = $flagFilters["aggregation_group_type_index"] ?? null;
+        $earlyExitEnabled = $flagFilters["early_exit"] ?? false;
+        $isInconclusive = false;
+
+        foreach ($flagConditions as $condition) {
+            try {
+                // Per-condition aggregation overrides only when the condition explicitly
+                // sets its own aggregation_group_type_index (mixed targeting). When absent,
+                // use the properties/bucketing already resolved by the caller.
+                $hasConditionAggregation = array_key_exists("aggregation_group_type_index", $condition);
+                $conditionAggregation = $hasConditionAggregation
+                    ? $condition["aggregation_group_type_index"]
+                    : $flagAggregation;
+
+                $effectiveProperties = $properties;
+                $effectiveBucketing = $distinctId;
+
+                // Mixed-override path: condition-level aggregation differs from flag-level.
+                // This assumes flag-level aggregation is null for mixed flags.
+                if ($conditionAggregation !== $flagAggregation) {
+                    if (!is_null($conditionAggregation)) {
+                        $groupName = $groupTypeMapping[strval($conditionAggregation)] ?? null;
+                        if (is_null($groupName) || !array_key_exists($groupName, $groups)) {
+                            continue;
+                        }
+                        if (!array_key_exists($groupName, $groupProperties)) {
+                            $isInconclusive = true;
+                            continue;
+                        }
+                        $effectiveProperties = $groupProperties[$groupName];
+                        $effectiveBucketing = $groups[$groupName];
+                    }
+                }
+
+                $matchResult = FeatureFlag::isConditionMatch(
+                    $flag,
+                    $effectiveBucketing,
+                    $condition,
+                    $effectiveProperties,
+                    $cohorts,
+                    $flagsByKey,
+                    $evaluationCache,
+                    $propertyMatchingVersion
+                );
+
+                if ($matchResult === ConditionMatch::Match) {
+                    $variantOverride = $condition["variant"] ?? null;
+                    $flagVariants = ($flagFilters["multivariate"] ?? [])["variants"] ?? [];
+                    $variantKeys = array_map(function ($variant) {
+                        return $variant["key"];
+                    }, $flagVariants);
+
+                    if ($variantOverride && in_array($variantOverride, $variantKeys)) {
+                        return $variantOverride;
+                    } else {
+                        return FeatureFlag::getMatchingVariant($flag, $effectiveBucketing) ?? true;
+                    }
+                } elseif ($earlyExitEnabled && $matchResult === ConditionMatch::OutOfRolloutBound) {
+                    // The condition's property filters (if any) matched and only the rollout check
+                    // failed, so re-evaluating later groups can't change the outcome. Return a
+                    // definitive false immediately, mirroring the server-side (Rust) engine.
+                    // But if a prior condition was inconclusive, we can't be definitive — stop
+                    // evaluating (early exit still applies to later groups) and let the
+                    // post-loop inconclusive check fall back to server evaluation. A throw here
+                    // would be swallowed by the catch below and evaluation would wrongly continue.
+                    if ($isInconclusive) {
+                        break;
+                    }
+                    return false;
+                }
+            } catch (RequiresServerEvaluationException $e) {
+                // Immediately propagate - this condition requires server-side data
+                throw $e;
+            } catch (InconclusiveMatchException $e) {
+                // If this is a flag dependency error, preserve the original message
+                if (
+                    strpos($e->getMessage(), "Cannot evaluate flag dependency") !== false ||
+                    strpos($e->getMessage(), "Circular dependency detected") !== false
+                ) {
+                    throw $e;
+                }
+                $isInconclusive = true;
+            }
+        }
+
+        if ($isInconclusive) {
+            throw new InconclusiveMatchException("Can't determine if feature flag is enabled or not with given properties"); //phpcs:ignore
+        }
+
+        return false;
+    }
+
+    private static function isConditionMatch(
+        $featureFlag,
+        $distinctId,
+        $condition,
+        $properties,
+        $cohorts,
+        $flagsByKey = null,
+        $evaluationCache = null,
+        $propertyMatchingVersion = 1
+    ): ConditionMatch {
+        $rolloutPercentage = array_key_exists("rollout_percentage", $condition) ? $condition["rollout_percentage"] : null;
+
+        if (count($condition['properties'] ?? []) > 0) {
+            foreach ($condition['properties'] as $property) {
+                $matches = false;
+                $propertyType = $property['type'] ?? null;
+                if ($propertyType == 'cohort') {
+                    $matches = FeatureFlag::matchCohort(
+                        $property,
+                        $properties,
+                        $cohorts,
+                        $flagsByKey,
+                        $evaluationCache,
+                        $distinctId,
+                        $propertyMatchingVersion
+                    );
+                } elseif ($propertyType == 'flag') {
+                    $matches = FeatureFlag::evaluateFlagDependency(
+                        $property,
+                        $flagsByKey,
+                        $evaluationCache,
+                        $distinctId,
+                        $properties,
+                        $cohorts,
+                        $propertyMatchingVersion
+                    );
+                } else {
+                    $matches = FeatureFlag::matchProperty($property, $properties, $propertyMatchingVersion);
+                }
+
+                if (!$matches) {
+                    return ConditionMatch::NoMatch;
+                }
+            }
+
+            if (is_null($rolloutPercentage)) {
+                return ConditionMatch::Match;
+            }
+        }
+
+        if (!is_null($rolloutPercentage) && FeatureFlag::hash($featureFlag["key"], $distinctId) > ($rolloutPercentage / 100)) { //phpcs:ignore
+            return ConditionMatch::OutOfRolloutBound;
+        }
+
+        return ConditionMatch::Match;
+    }
+
+    private static function isRegularExpression($string)
+    {
+        if ($string === null) {
+            return false;
+        }
+        set_error_handler(function () {
+        }, E_WARNING);
+        $isRegularExpression = preg_match($string, "") !== false;
+        restore_error_handler();
+        return $isRegularExpression;
+    }
+
+    private static function prepareValueForRegex($value)
+    {
+        $regex = $value;
+
+        // If delimiter already exists, do nothing
+        if (FeatureFlag::isRegularExpression($regex)) {
+            return $regex;
+        }
+
+        if (substr($regex, 0, 1) != "/") {
+            $regex = "/" . $regex;
+        }
+
+        if (substr($regex, -1) != "/") {
+            $regex = $regex . "/";
+        }
+
+        return $regex;
+    }
+
+    /**
+     * Evaluate a feature flag dependency property.
+     *
+     * @param array<string, mixed> $property Flag dependency property.
+     * @param array<string, array<string, mixed>>|null $flagsByKey Local feature flag definitions keyed by key.
+     * @param array<string, mixed>|null $evaluationCache Cache used for dependency evaluation.
+     * @param string $distinctId Distinct ID used for bucketing.
+     * @param array<string, mixed> $properties Person or group properties for evaluation.
+     * @param array<string, mixed> $cohortProperties Local cohort definitions keyed by cohort ID.
+     * @param mixed $propertyMatchingVersion Definition snapshot selector; defaults to legacy matching.
+     * @return bool Whether the dependency matches.
+     * @throws InconclusiveMatchException When the dependency cannot be evaluated locally.
+     */
+    public static function evaluateFlagDependency(
+        $property,
+        $flagsByKey,
+        $evaluationCache,
+        $distinctId,
+        $properties,
+        $cohortProperties,
+        $propertyMatchingVersion = 1
+    ) {
+        if ($flagsByKey === null || $evaluationCache === null) {
+            throw new InconclusiveMatchException(sprintf(
+                "Cannot evaluate flag dependency on '%s' without flags_by_key and evaluation_cache",
+                $property["key"] ?? "unknown"
+            ));
+        }
+
+        // Check if dependency_chain is present - it should always be provided for flag dependencies
+        if (!array_key_exists("dependency_chain", $property)) {
+            throw new InconclusiveMatchException(sprintf(
+                "Cannot evaluate flag dependency on '%s' without dependency_chain",
+                $property["key"] ?? "unknown"
+            ));
+        }
+
+        $dependencyChain = $property["dependency_chain"];
+
+        // Handle circular dependency (empty chain means circular)
+        if (count($dependencyChain) === 0) {
+            throw new InconclusiveMatchException(sprintf(
+                "Circular dependency detected for flag '%s'",
+                $property["key"] ?? "unknown"
+            ));
+        }
+
+        // The flag key to evaluate is in the "key" field
+        $depFlagKey = $property["key"] ?? null;
+        if (!$depFlagKey) {
+            throw new InconclusiveMatchException(sprintf(
+                "Flag dependency missing 'key' field: %s",
+                json_encode($property)
+            ));
+        }
+
+        // Check if we've already evaluated this flag
+        if (!array_key_exists($depFlagKey, $evaluationCache)) {
+            // Need to evaluate this dependency first
+            $depFlag = $flagsByKey[$depFlagKey] ?? null;
+            if (!$depFlag) {
+                // Missing flag dependency - cannot evaluate locally
+                $evaluationCache[$depFlagKey] = null;
+                throw new InconclusiveMatchException(sprintf(
+                    "Cannot evaluate flag dependency '%s' - flag not found in local flags",
+                    $depFlagKey
+                ));
+            } else {
+                // Check if the flag is active (same check as in Client::computeFlagLocally)
+                if (!($depFlag["active"] ?? false)) {
+                    $evaluationCache[$depFlagKey] = false;
+                } else {
+                    // Recursively evaluate the dependency
+                    try {
+                        $depResult = FeatureFlag::matchFeatureFlagProperties(
+                            $depFlag,
+                            $distinctId,
+                            $properties,
+                            $cohortProperties,
+                            $flagsByKey,
+                            $evaluationCache,
+                            propertyMatchingVersion: $propertyMatchingVersion
+                        );
+                        $evaluationCache[$depFlagKey] = $depResult;
+                    } catch (InconclusiveMatchException $e) {
+                        // If we can't evaluate a dependency, store null and propagate the error
+                        $evaluationCache[$depFlagKey] = null;
+                        throw new InconclusiveMatchException(sprintf(
+                            "Cannot evaluate flag dependency '%s': %s",
+                            $depFlagKey,
+                            $e->getMessage()
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Get the evaluated flag value
+        $flagValue = $evaluationCache[$depFlagKey];
+        if ($flagValue === null) {
+            // Previously inconclusive - raise error again
+            throw new InconclusiveMatchException(sprintf(
+                "Flag dependency '%s' was previously inconclusive",
+                $depFlagKey
+            ));
+        }
+
+        // Now check if the flag value matches the expected value in the property
+        $expectedValue = $property["value"] ?? null;
+        $operator = $property["operator"] ?? "exact";
+
+        if ($expectedValue !== null) {
+            // For flag dependencies, we need to compare the actual flag result with expected value
+            // using the flag_evaluates_to operator logic
+            if ($operator === "flag_evaluates_to") {
+                return FeatureFlag::matchesDependencyValue($expectedValue, $flagValue);
+            } else {
+                // This should never happen, but just to be defensive
+                throw new InconclusiveMatchException(sprintf(
+                    "Flag dependency property for '%s' has invalid operator '%s'",
+                    $depFlagKey,
+                    $operator
+                ));
+            }
+        }
+
+        // If no value check needed, return true (all dependencies passed)
+        return true;
+    }
+
+    /**
+     * Compare an expected flag dependency value with an evaluated flag value.
+     *
+     * @param mixed $expectedValue Expected dependency value from the property filter.
+     * @param mixed $actualValue Actual evaluated flag value.
+     * @return bool Whether the values match dependency semantics.
+     */
+    public static function matchesDependencyValue($expectedValue, $actualValue)
+    {
+        // String variant case - check for exact match or boolean true
+        if (is_string($actualValue) && strlen($actualValue) > 0) {
+            if (is_bool($expectedValue)) {
+                // Any variant matches boolean true
+                return $expectedValue;
+            } elseif (is_string($expectedValue)) {
+                // variants are case-sensitive, hence our comparison is too
+                return $actualValue === $expectedValue;
+            } else {
+                return false;
+            }
+        } elseif (is_bool($actualValue) && is_bool($expectedValue)) {
+            // Boolean case - must match expected boolean value
+            return $actualValue === $expectedValue;
+        }
+
+        // Default case
+        return false;
+    }
+}

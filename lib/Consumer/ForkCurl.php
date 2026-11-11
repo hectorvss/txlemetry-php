@@ -1,0 +1,123 @@
+<?php
+
+namespace Txlemetry\Consumer;
+
+use Txlemetry\QueueConsumer;
+
+/**
+ * Queue consumer that sends batches through a forked curl process.
+ *
+ * @internal
+ */
+class ForkCurl extends QueueConsumer
+{
+    protected $type = "ForkCurl";
+
+    /**
+     * Creates a new queued fork consumer which queues fork and identify
+     * calls before adding them to
+     * @param string $apiKey Project API key.
+     * @param array<string, mixed> $options Consumer options.
+     */
+    public function __construct($apiKey, $options = array())
+    {
+        parent::__construct($apiKey, $options);
+    }
+
+    /**
+     * Define getter method for consumer type
+     *
+     * @return string
+     */
+    public function getConsumer()
+    {
+        return $this->type;
+    }
+
+    /**
+     * Make an async request to our API. Fork a curl process, immediately send
+     * to the API. If debug is enabled, we wait for the response.
+     * @param array<int, array<string, mixed>> $messages Array of messages to send.
+     * @return bool|string Whether the request succeeded or a queue failure classification.
+     */
+    public function flushBatch($messages)
+    {
+        $payload = $this->encodeBatchPayload($messages);
+        if (false === $payload) {
+            return self::FLUSH_BATCH_NON_RETRYABLE_FAILURE;
+        }
+
+        // Escape for shell usage and reject payloads that expand beyond the
+        // configured safety limit before creating compression temporary files.
+        try {
+            $payload = escapeshellarg($payload);
+        } catch (\ValueError $error) {
+            $this->handleError($error->getCode(), $error->getMessage());
+            return self::FLUSH_BATCH_NON_RETRYABLE_FAILURE;
+        }
+        if ($this->payloadExceedsSizeLimit($payload)) {
+            return self::FLUSH_BATCH_NON_RETRYABLE_FAILURE;
+        }
+
+        $protocol = $this->ssl() ? "https://" : "http://";
+
+        $path = "/batch/";
+        $url = $protocol . $this->host . $path;
+
+        $cmd = "curl -X POST -H 'Content-Type: application/json'";
+
+        $tmpfname = "";
+        if ($this->compress_request) {
+            // Compress request to file
+            $tmpfname = tempnam("/tmp", "forkcurl_");
+            $cmd2 = "printf '%s' " . $payload . " | gzip > " . $tmpfname;
+            exec($cmd2, $output, $exit);
+
+            if (0 == $exit) {
+                $cmd .= " -H 'Content-Encoding: gzip'";
+                $cmd .= " --data-binary '@" . $tmpfname . "'";
+            } else {
+                $this->handleError($exit, $output);
+                if (is_file($tmpfname)) {
+                    unlink($tmpfname);
+                }
+                $tmpfname = "";
+                $cmd .= " -d " . $payload;
+            }
+        } else {
+            $cmd .= " -d " . $payload;
+        }
+
+        $cmd .= " '" . $url . "'";
+
+        // Send user agent in the form of {library_name}/{library_version} as per RFC 7231.
+        $cmd .= " -H 'User-Agent: " . $this->userAgent() . "'";
+
+        if (!$this->debug()) {
+            $cmd .= " > /dev/null 2>&1 &";
+        }
+
+        exec($cmd, $output, $exit);
+
+        if (0 != $exit) {
+            $this->handleError($exit, $output);
+        }
+
+        if ($tmpfname != "") {
+            unlink($tmpfname);
+        }
+
+        if (0 == $exit) {
+            return true;
+        }
+
+        return $this->isNetworkCurlExit($exit)
+            ? self::FLUSH_BATCH_RETRYABLE_FAILURE
+            : self::FLUSH_BATCH_NON_RETRYABLE_FAILURE;
+    }
+
+    private function isNetworkCurlExit($exit)
+    {
+        return in_array((int) $exit, [6, 7, 28, 35, 52, 56], true);
+    }
+}
